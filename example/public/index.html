@@ -1,7 +1,28 @@
 <!doctype html>
 
-<canvas id="screen" style="border: 1px solid red;"></canvas>
+<html>
+
+<div>
+  <span class="finger finger-0" style="transform: translate3d(0, 0, 0);"></span>
+  <span class="finger finger-1"></span>
+  <canvas id="screen" style="border: 1px solid red;"></canvas>
+  <div>
+    <input type="text" id="input" v-model="inputText" placeholder="Input text..." @keyup.enter="sendText(inputText + '\n')">
+    <button onclick="sendText();">send text</button>
+    <button onclick="clearText();">clear text</button>
+  </div>
+</div>
+<div>
+    <button id="home" onclick="home();">home</button>
+</div>
 <script src="/config.js"></script>
+<script src="//cdn.jsdelivr.net/g/vue@2.1.10,jquery@3.1.1"></script>
+<script src="/jquery-1.4.4.min.js"></script>
+<script src="/vue.js"></script>
+<script src="/canvas2image.js"></script>
+<script src="/upload.js"></script>
+<script src="/ajaxfileupload.js"></script>
+
 <script>
 /*jshint browser:true*/
 
@@ -160,6 +181,362 @@ RenderLoop.prototype.run = function () {
   this.next()
 }
 
+// **** START ****
+      var app = new Vue({
+        el: "#screen",
+        // delimiters: ["[[", "]]"],
+        data: {
+            display: {
+                width: 800,
+                height: 1300,
+                naturalWidth: 0,
+                naturalHeight: 0,
+            },
+            refreshCount: 0,
+            sessionId: null,
+            pageHidden: false,
+            current: 0,
+            inputText: '',
+            wsAdmin: null,
+            record: {
+                running: false,
+                startTime: 0,
+                ticker: null,
+                duration: 0,
+                prompt: '',
+            },
+            records: [{
+                name: "20170603-test",
+            }]
+        },
+
+
+        filters: {
+            formatDuration: function (value) {
+                function pad2(number) {
+                    return (number < 10 ? '0' : '') + number
+                }
+
+                var totalSeconds = Math.floor(value / 1000); //"00:00:00"
+                var mms = value % 1000;
+                var ms = totalSeconds % 60;
+                var mm = (totalSeconds - ms) / 60
+                return "" + pad2(mm) + " : " + pad2(ms);
+            }
+        },
+        mounted: function () {
+            var self = this;
+
+            this.initTouchListener();
+            this.initScreenSize();
+            var self = this;
+            $("#screen")[0].onload = function (e) {
+                var nw = e.target.naturalWidth;
+                var nh = e.target.naturalHeight;
+                if (nw && nh && self.display.naturalHeight != nh) {
+                    self.display.naturalWidth = nw;
+                    self.display.naturalHeight = nh;
+
+                    console.log("naturalWidth=" + nw + "; naturalHeight=" + nh)
+                    self.initScreenSize();
+                    console.log("Detect screen rotate");
+                }
+            }.bind(this);
+        },
+        methods: {
+
+            tap: function (x, y) {
+                var self = this;
+                return $.ajax({
+                    url: "/ios/tap/?x=" + x + "&y=" + y,
+                    method: "GET",
+                }).then(function (ret) {
+                    if (ret.status !== 0) {
+                        console.log(ret.value);
+                        return "Fail"
+                    } else {
+                        return "Success";
+                    }
+                })
+            },
+            tapHold: function (x, y, duration) {
+                var self = this;
+                duration = duration / 1000
+                return $.ajax({
+                    url: "/ios/tapHold?x=" + x + "&y=" + y + "&duration=" + duration,
+                    method: "GET",
+                }).then(function (ret) {
+                    if (ret.status !== 0) {
+                        console.log(ret.value);
+                    } else {
+                        return "Success";
+                    }
+                })
+            },
+            swipe: function (fromX, fromY, toX, toY) {
+                var self = this;
+                return $.ajax({
+                    url: "/ios/swipe?fromX=" + fromX + "&fromY=" + fromY + "&toX=" + toX + "&toY=" + toY + "&duration=" + 0.2,
+                    method: "GET",
+                })
+            },
+            home: function () {
+                return $.ajax({
+                    url: "/ios/homeScreen",
+                    method: "GET",
+                })
+                    .then(function (ret) {
+                        console.log(ret);
+                    })
+            },
+            sendText: function (text) {
+                inputText = document.getElementById('input').value
+                return $.ajax({
+                    url: "/ios/inputText?value=" + inputText,
+                    method: "GET",
+
+                })
+                    .then(function (ret) {
+                        console.log(ret);
+                    })
+            },
+
+            clearText: function (n) {
+                this.sendText("\b".repeat(n || 30))
+            },
+
+            initScreenSize: function () {
+//                $.ajax({
+//                    url: "/ios/status",
+//                })
+//                    .then(function(ret) {
+//                        this.sessionId = ret.sessionId;
+//                        return $.ajax({
+//                            url: "/ios/windowsize",
+//                        })
+//                    }.bind(this))
+//                    .then(function(ret) {
+//                        console.log("ret value : " + ret.value);
+//                        this.display.width = ret.value.width;
+//                        this.display.height = ret.value.height;
+//                    }.bind(this))
+            },
+            initTouchListener: function () {
+                var self = this;
+                var element = $("#screen")[0];
+                var screen = {
+                    bounds: {},
+                    firstPosition: {},
+                    secondPosition: {},
+                    beginTime: null,
+                }
+                var _longClickTimeout = 800;
+
+                function calculateBounds() {
+                    var el = element;
+                    screen.bounds.w = el.offsetWidth
+                    screen.bounds.h = el.offsetHeight
+                    screen.bounds.x = 0
+                    screen.bounds.y = 0
+
+                    // 计算画布边框的距离
+                    while (el.offsetParent) {
+                        screen.bounds.x += el.offsetLeft
+                        screen.bounds.y += el.offsetTop
+                        el = el.offsetParent
+                    }
+                }
+
+                function deactiveFinger(index) {
+                    $(".finger-" + index).removeClass("active").removeClass("longClick")
+                }
+
+                function convertPosition(event) {
+                    var e = event;
+                    if (e.originalEvent) {
+                        e = e.originalEvent
+                    }
+                    // Ignore mouse right click
+                    if (e.which === 3) {
+                        return;
+                    }
+                    e.preventDefault()
+                    calculateBounds()
+                    console.log("page x: " + e.pageX + ", page y: " + e.pageY)
+                    var x = e.pageX - screen.bounds.x - 30
+                    var y = e.pageY - screen.bounds.y
+                    
+                    /*
+                    return {
+                      e: e,
+                      x: Math.floor(x / (element.clientWidth - 60) * self.display.width),
+                      y: Math.floor(y / element.clientHeight * self.display.height),
+                      pageX: x,
+                      pageY: y,
+                    }
+                     */
+
+                    var deviceWidth = 414
+                    , deviceHeight = 736
+
+                    console.log(`x * deviceWidth / element.clientWidth = ${x} * ${deviceWidth} / ${element.clientWidth}`)
+                    console.log(`y * deviceHeight / element.clientHeight = ${y} * ${deviceHeight} / ${element.clientHeight}`)
+
+                    return {
+                      e: e,
+                      x: (x * deviceWidth / element.clientWidth).toFixed(2),
+                      y: (y * deviceHeight / element.clientHeight).toFixed(2),
+                      pageX: x,
+                      pageY: y
+                    }
+                }
+
+                function stopMousing() {
+                    element.removeEventListener('mousemove', mouseMoveListener);
+                    document.removeEventListener('mouseup', mouseUpListener);
+                }
+
+                function mouseUpListener(event) {
+                    var p = convertPosition(event);
+                    stopMousing()
+
+                    var first = screen.firstPosition,
+                        second = screen.secondPosition;
+
+                    screen.secondPosition = {};
+                    // element.style.cursor = 'not-allowed'
+                    clearTimeout(screen.longClickKey);
+                    var defer;
+                    if (second && (second.x || second.y)) {
+                        console.log("Swipe", first, second);
+                        defer = self.swipe(first.x, first.y, second.x, second.y);
+                    } else {
+                        var holdTime = new Date().getTime() - screen.beginTime;
+                        if (holdTime > _longClickTimeout) {
+                            console.log("LongTap", first);
+                            defer = self.tapHold(first.x, first.y, holdTime)
+                        } else {
+                            console.log("Tap", first);
+                            defer = self.tap(first.x, first.y)
+                        }
+                    }
+                    defer.then(function () {
+                        console.log("Release operation")
+                        deactiveFinger(0);
+                        deactiveFinger(1);
+                        element.style.cursor = 'auto'
+                    })
+                }
+
+                function mouseMoveListener(event) {
+                    var p = convertPosition(event);
+                    var first = screen.firstPosition;
+                    var distance = Math.sqrt((first.x - p.x) * (first.x - p.x) + (first.y - p.y) * (first.y - p.y));
+                    if (distance > 10) {
+                        screen.secondPosition = {
+                            x: p.x,
+                            y: p.y
+                        };
+                        console.log(p);
+                        $(".finger-1")
+                            .addClass("active")
+                            .css("transform", 'translate3d(' + p.pageX + 'px,' + p.pageY + 'px,0)')
+                    } else {
+                        deactiveFinger("1");
+                        screen.secondPosition = {};
+                    }
+                }
+
+                function mouseDownListener(event) {
+                    /*
+                    if (element.style.cursor == 'not-allowed') {
+                        return;
+                    }
+                    */
+                    var p = convertPosition(event);
+                    var index = 0;
+                    $(".finger-" + index)
+                        .addClass("active")
+                        .css("transform", 'translate3d(' + p.pageX + 'px,' + p.pageY + 'px,0)')
+
+                    screen.longClickKey = setTimeout(function () {
+                        $(".finger-0").addClass("longClick");
+                    }, _longClickTimeout)
+
+                    screen.beginTime = new Date().getTime();
+                    screen.firstPosition = {
+                        x: p.x,
+                        y: p.y
+                    }
+
+                    element.addEventListener('mousemove', mouseMoveListener);
+                    document.addEventListener('mouseup', mouseUpListener);
+                }
+
+                element.addEventListener("mousedown", mouseDownListener);
+            }
+        }
+    })
+
+    function home() {
+      $.ajax({
+        url: '/ios/home'
+        , method: 'GET'
+      })
+      .then(ret => {
+        console.log(ret)
+      })
+    }
+
+    function sendText() {
+      var sendValue = encodeURI(encodeURI.getElementById('input').value)
+      console.log('Input text = ' + sendValue)
+      $.ajax({
+        url: '/ios/inputText?value=' + sendValue
+        , method: 'GET'
+      })
+      .then(ret => {
+        console.log(ret)
+      })
+    }
+
+    function clearText() {
+      $.ajax({
+        url: '/ios/clear'
+        , method: 'GET'
+      })
+      .then(ret => {
+        console.log(ret)
+      })
+    }
+
+    function launchApp() {
+      var id = document.getElementById('bundleid').value
+      if(id = '') {
+        $.ajax({
+          url: '/ios/launchapp?id=' + id
+          , method: 'GET'
+        })
+        .then(ret => {
+          console.log(ret)
+        })
+      }
+    }
+
+    function uninstallApp() {
+      var id = document.getElementById('uninstallid').value
+      if(id != "") {
+        $.ajax({
+          url: '/ios/uninstall?id=' + id
+          , method: 'GET'
+        })
+        .then(ret => {
+          console.log(ret)
+        })
+      }
+    }
+// **** E N D ****
+
 var pipeline = new Pipeline()
 var canvas = document.getElementById('screen')
 var renderLoop = new RenderLoop(pipeline, canvas)
@@ -191,3 +568,5 @@ ws.onopen = function() {
 }
 
 </script>
+
+</html>
